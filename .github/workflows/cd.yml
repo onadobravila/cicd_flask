@@ -1,0 +1,58 @@
+name: CD
+
+on:
+  workflow_run:
+    workflows: ["CI"]
+    types: [completed]
+
+jobs:
+  deploy_kind:
+    if: ${{ github.event.workflow_run.conclusion == 'success' }}
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set image name
+        run: echo "IMAGE=docker.io/${{ secrets.DOCKERHUB_USERNAME }}/cicd-flask" >> $GITHUB_ENV
+
+      - name: Install kind
+        run: |
+          curl -Lo kind https://kind.sigs.k8s.io/dl/v0.24.0/kind-linux-amd64
+          chmod +x kind
+          sudo mv kind /usr/local/bin/kind
+
+      - name: Create cluster
+        run: kind create cluster --name demo
+
+      - name: Install kubectl
+        uses: azure/setup-kubectl@v4
+        with:
+          version: v1.30.0
+
+      - name: Install Helm
+        uses: azure/setup-helm@v4
+        with:
+          version: v3.15.4
+
+      - name: Pull & load image into kind
+        run: |
+          docker pull $IMAGE:sha-${{ github.event.workflow_run.head_sha }}
+          kind load docker-image $IMAGE:sha-${{ github.event.workflow_run.head_sha }} --name demo
+
+      - name: Deploy with Helm
+        run: |
+          helm upgrade --install myapp ./charts/myapp \
+            --set image.repository=${{ env.IMAGE }} \
+            --set image.tag=sha-${{ github.event.workflow_run.head_sha }} \
+            --set env.GIT_SHA=${{ github.event.workflow_run.head_sha }}
+
+      - name: Wait rollout
+        run: kubectl rollout status deploy/myapp --timeout=120s
+
+      - name: Smoke test
+        run: |
+          kubectl port-forward deploy/myapp 8080:8080 &
+          sleep 2
+          curl -fsS http://localhost:8080/health
+          curl -fsS http://localhost:8080/version | grep -q "${{ github.event.workflow_run.head_sha }}"
